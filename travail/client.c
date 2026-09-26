@@ -48,59 +48,53 @@ int recv_from_socket(int socket_fd, void* buf, int size){
     return size_read;
 }
 
-void echo_client(int sockfd) {
+void msg_to_server(int sockfd){
 	char buff[MSG_LEN];
-	int n;
-	while (1) {
-		// Cleaning memory
-		memset(buff, 0, MSG_LEN);
-		// Getting message from client
-		printf("Message: ");
-		n = 0;
-		while ((buff[n++] = getchar()) != '\n') {} // trailing '\n' will be sent
-		// Sending message (ECHO)
-		struct header client_header = {0};
-		client_header.size = strlen(buff) + 1; // \0 => +1
-		send_on_socket(sockfd, &client_header, sizeof(struct header));
-		send_on_socket(sockfd, buff, client_header.size);
-		printf("Message sent!\n");
+	memset(buff, 0, MSG_LEN);
 
-		// Receiving server response 
-		struct header server_header = {0};
-		int size_read = recv_from_socket(sockfd, &server_header, sizeof(struct header));
-
-		char* server_msg = NULL;
-		server_msg = malloc(server_header.size * sizeof(char));
-		if (server_msg == NULL) {
-			continue;
-		}
-		
-		size_read = recv_from_socket(sockfd, server_msg, server_header.size);
-		if (size_read == 0) {
-			fprintf(stdout, "Closing during reading Payload \n");
-			free(server_msg);
-			continue;
-		} else if (strcmp(server_msg, QUIT) == 0){ // We already send the message /quit to alert the client to close his connection
-			fprintf(stdout, "Closing Connection OK \n");
-			free(server_msg);
-			break;		
-		}
-		printf("Received: %s\n", server_msg);
-
-
-
-		// if (send(sockfd, buff, strlen(buff), 0) <= 0) {
-		// 	break;
-		// }
-		// 
-		// // Cleaning memory
-		// memset(buff, 0, MSG_LEN);
-		// // Receiving message
-		// if (recv(sockfd, buff, MSG_LEN, 0) <= 0) {
-		// 	break;
-		// }
-		// printf("Received: %s", buff);
+	ssize_t n = read(STDIN_FILENO, buff, MSG_LEN - 1);
+	if (n <= 0){
+		close(sockfd);
+		exit(EXIT_SUCCESS);
 	}
+	buff[n] = '\0';
+
+	struct header client_h = {0};
+    client_h.size = n + 1;
+    send_on_socket(sockfd, &client_h, sizeof(struct header));
+    send_on_socket(sockfd, buff, client_h.size);
+    printf("Message sent!\n");
+
+
+}
+
+int msg_from_server(int sockfd) {
+    struct header server_h = {0};
+    int r = recv_from_socket(sockfd, &server_h, sizeof(struct header));
+    if (r == 0) {
+        fprintf(stdout, "Server closed the connection\n");
+        return 1;
+    }
+    char* msg = malloc(server_h.size);
+    if (msg == NULL){
+		return 0;
+	}
+
+    r = recv_from_socket(sockfd, msg, server_h.size);
+    if (r == 0) {
+        fprintf(stdout, "Closing during reading Payload\n");
+        free(msg);
+        return 1;
+    }
+    if (strcmp(msg, QUIT) == 0) {
+        fprintf(stdout, "Closing Connection OK\n");
+        free(msg);
+        return 1;
+    }
+
+    printf("Received: %s\n", msg);
+    free(msg);
+    return 0;
 }
 
 int handle_connect(char* server_port, char* server_ip) {
@@ -142,33 +136,35 @@ int main(int argc, char** argv) {
 	int sfd;
 	sfd = handle_connect(server_port, server_ip);
 
-	// struct pollfd fds[2]; // SIZE 2 : STDIN_FILENO / sfd
+	struct pollfd fds[2]; // SIZE 2 : STDIN_FILENO / sfd
 
+	fds[0].fd = STDIN_FILENO;
+    fds[0].events = POLLIN;
+    fds[0].revents = 0;
 
-	// fds[0].fd = STDIN_FILENO;
-    // fds[0].events = POLLIN;
-    // fds[0].revents = 0;
+	fds[1].fd = sfd;
+    fds[1].events = POLLIN;
+    fds[1].revents = 0;
 
-	// fds[1].fd = sfd;
-    // fds[1].events = POLLIN;
-    // fds[1].revents = 0;
+	printf("Message: ");
+    fflush(stdout); // To flush stdout. If not the buffer is not initialised correctly after
 
-	// while(1){
-	// 	int nb_fds = poll(fds, 2, -1);
-    //     die(nb_fds, "Poll: ");
-    //     fprintf(stdout, "Nb active fd : %d\n", nb_fds);
-    //     if (fds[0].revents & POLLIN){ // STDIN_FILENO
-	// 		fds[0].revents = 0;
-	// 		echo_client(sfd);
-	// 		printf("Test");
+	while(1){
+		int nb_fds = poll(fds, 2, -1);
+        die(nb_fds, "Poll: ");
+        //fprintf(stdout, "Nb active fd : %d\n", nb_fds);
+        if (fds[0].revents & POLLIN){ // STDIN_FILENO
+			msg_to_server(sfd);
 			
-	// 	} else if (fds[1].revents & POLLIN){ // sfd
-	// 		fds[1].revents = 0;
-	// 		echo_client(sfd);
-	// 	}
-	// }
-
-	echo_client(sfd);
+		} else if (fds[1].revents & POLLIN){ // sfd
+			int server_resp = msg_from_server(sfd);
+			if (server_resp){
+				break;
+			}
+			printf("Message: ");
+			fflush(stdout);
+		}
+	}
 	close(sfd);
 	return EXIT_SUCCESS;
 }
