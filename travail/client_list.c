@@ -14,14 +14,15 @@ int add_client(struct client_node** head, int fd, struct sockaddr_storage addr, 
     time_t time_now = time(NULL);
     if (time_now == (time_t)-1){
         perror("Time:");
+        free(new_node);
         return -1;
     }
-
     new_node->next = *head;
     new_node->fd = fd;
     new_node->addr = addr;
     new_node->addr_len = addr_len;
     new_node->nickname[0] = '\0';
+    new_node->channel[0] = '\0';
     new_node->connected_at = time_now;
     *head = new_node;
     return 0;
@@ -35,11 +36,9 @@ int remove_client(struct client_node** head, int fd){
         previous_node = curent_node;
         curent_node = curent_node->next;
     }
-
     if (curent_node == NULL) {
         return -1;  // Not found
     }
-
     if (previous_node == NULL) {
         *head = curent_node->next;
     } else {
@@ -103,4 +102,13 @@ void free_list(struct client_node** head){
         current = next;
     }
     *head = NULL;
+}
+
+int channel_exists(struct client_node *head, const char *name) {
+    for (struct client_node *c = head; c; c = c->next) {
+        if (c->channel[0] != '\0' && strcmp(c->channel, name) == 0){
+            return 1;
+        }
+    }
+    return 0;
 }

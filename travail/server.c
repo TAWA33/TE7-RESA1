@@ -11,7 +11,25 @@
 #include <unistd.h>
 #include<poll.h>
 #include <ctype.h>
+#include <errno.h>
+#include <signal.h>
 
+static volatile sig_atomic_t stop = 0;
+
+static void on_signal(int sig) {
+    (void)sig;
+    stop = 1;
+}
+
+static void signal_stop_server_install(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_signal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT,  &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+}
 
 int first_fds_available(struct pollfd * fds, int size){
     for (int i = 1 ; i < size ; i++){
@@ -22,20 +40,13 @@ int first_fds_available(struct pollfd * fds, int size){
     return -1;
 }
 
-void closing_connection(struct pollfd *fds, int i, struct client_node** head) {
-	remove_client(head, fds[i].fd);
-    close(fds[i].fd);
-    fds[i].fd = -1;
-    fds[i].events = 0;
-    fds[i].revents = 0;
-}
 
 int send_message(int sockfd, struct message *msg, char *payload) {
-    if (send_on_socket(sockfd, msg, sizeof(struct message)) < 0){
+    if (send_on_socket(sockfd, msg, sizeof(struct message)) != (int)sizeof(struct message)){
         return -1;
     }
     if (msg->pld_len > 0 && payload != NULL) {
-        if (send_on_socket(sockfd, (void *)payload, msg->pld_len) < 0){
+        if (send_on_socket(sockfd, (void *)payload, msg->pld_len) != msg->pld_len){
             return -1;
         }
     }
@@ -50,30 +61,80 @@ void send_server_info(int sockfd, char *text) {
     send_message(sockfd, &msg, text);
 }
 
-int handle_client_message(struct client_node *head, struct client_node *me, struct message *msg, char *payload) {
+void forward_to_nickname(struct client_node *head, struct client_node *me, enum msg_type type, char *dest_nickname, char *payload, int pld_len){
+    struct client_node *dest = find_client_with_name(head, dest_nickname);
+    if (dest == NULL) {
+        send_server_info(me->fd, "This nickname doesn't exist.");
+        return;
+    }
+    struct message out = {0};
+    out.type = type;
+    out.pld_len = (payload != NULL) ? pld_len : 0;
+    strncpy(out.nick_sender, me->nickname, NICK_LEN - 1);
+    send_message(dest->fd, &out, payload ? payload : "");
+}
 
+int is_valid_nickname(const char* nickname) {
+    size_t len = strlen(nickname);
+    if (len == 0 || len >= NICK_LEN){
+        return 0;
+    }
+    for (size_t i = 0; i < len; i++) {
+        if (!isalnum((unsigned char)nickname[i])){
+            return 0;
+        }
+    }
+    return 1;
+}
+
+void notify_channel(struct client_node *head, char *channel, char *text, int exclude_fd) {
+    struct message out = {0};
+    out.type = MULTICAST_SEND;
+    out.pld_len = (int)strlen(text) + 1;
+    strncpy(out.nick_sender, "SERVER", NICK_LEN - 1);
+    strncpy(out.infos, channel, INFOS_LEN - 1);
+    for (struct client_node *c = head; c; c = c->next) {
+        if (c->fd != exclude_fd && c->channel[0] != '\0' && strcmp(c->channel, channel) == 0) {
+            send_message(c->fd, &out, (char *)text);
+        }
+    }
+}
+
+void closing_connection(struct pollfd *fds, int i, struct client_node** head) {
+    struct client_node *me = find_client_with_fd(*head, fds[i].fd);
+    if (me != NULL && me->channel[0] != '\0' && me->nickname[0] != '\0') {
+        char info[MSG_LEN];
+        snprintf(info, sizeof(info), "%s has quit %s", me->nickname, me->channel);
+        notify_channel(*head, me->channel, info, fds[i].fd);
+    }
+    remove_client(head, fds[i].fd);
+    close(fds[i].fd);
+    fds[i].fd = -1;
+    fds[i].events = 0;
+    fds[i].revents = 0;
+}
+
+int handle_client_message(struct client_node *head, struct client_node *me, struct message *msg, char *payload) {
     if (msg->type != NICKNAME_NEW && me->nickname[0] == '\0') {
         send_server_info(me->fd, "Please set a nickname with /nick <pseudo> first.");
         return 0;
     }
     //printf("STRUCT MSG : %d / %s / %s / %s\n", msg->pld_len, msg->nick_sender, msg_type_str[msg->type], msg->infos);
-
     switch (msg->type) {
         case NICKNAME_NEW: {
             char *new_nick = msg->infos;
-
-            size_t len = strlen(new_nick);
-            if (len == 0 || len >= NICK_LEN) {
-                send_server_info(me->fd, "Invalid nickname: must be between 1 and 127 characters.");
+            if (strcmp(new_nick, "SERVER") == 0) {
+                send_server_info(me->fd, "This nickname is reserved.");
                 return 0;
             }
-            for (size_t i = 0; i < len; i++) {
-                if (!isalnum((unsigned char)new_nick[i])) {
-                    send_server_info(me->fd, "Invalid nickname: letters and digits only.");
-                    return 0;
-                }
+
+            int ret_val = is_valid_nickname(new_nick);
+            if (ret_val == 0){
+                fprintf(stderr, "Invalid nickname. Must be between 1 and 127 characters (between 1 and 127 characters).");
             }
-            if (nickname_exists(head, (char *)new_nick)) {
+
+            struct client_node *other = find_client_with_name(head, new_nick);
+            if (other != NULL && other != me) {
                 send_server_info(me->fd, "Nickname already taken.");
                 return 0;
             }
@@ -119,7 +180,6 @@ int handle_client_message(struct client_node *head, struct client_node *me, stru
                 send_server_info(me->fd, "Unknown user.");
                 return 0;
             }
-
             char ip[INET6_ADDRSTRLEN] = {0};
             int port = 0;
             if (target->addr.ss_family == AF_INET) { // IPv4 case
@@ -145,7 +205,6 @@ int handle_client_message(struct client_node *head, struct client_node *me, stru
             send_message(me->fd, &out, buf);
             return 0;
         }
-
         case BROADCAST_SEND: {
             struct message out = {0};
             out.type = BROADCAST_SEND;
@@ -164,33 +223,174 @@ int handle_client_message(struct client_node *head, struct client_node *me, stru
             while(clients_fd[i] != -1){
                 if (clients_fd[i] != me->fd){
                     send_message(clients_fd[i], &out, payload);
-                    printf("Sending to %d\n", clients_fd[i]);
                 }
                 i++;
             }
             free(clients_fd);
             return 0;
-
+        }
+        case UNICAST_SEND: {
+            forward_to_nickname(head, me, UNICAST_SEND, msg->infos, payload, msg->pld_len);
+            return 0;
+        }
+        case FILE_REQUEST: {
+            forward_to_nickname(head, me, FILE_REQUEST, msg->infos, payload, msg->pld_len);
+            return 0;
         }
 
-        case UNICAST_SEND: {
+        case FILE_REJECT: {
+            forward_to_nickname(head, me, FILE_REJECT, msg->infos, NULL, 0);
+            return 0;
+        }
+        case FILE_ACCEPT: {
+            forward_to_nickname(head, me, FILE_ACCEPT, msg->infos, payload, msg->pld_len);
+            return 0;
+        }
+        case MULTICAST_CREATE: {
+            char *name = msg->infos;
+            if (!is_valid_nickname(name)) {
+                send_server_info(me->fd, "Invalid channel name: letters and digits only.");
+                return 0;
+            }
+            if (channel_exists(head, name)) {
+                send_server_info(me->fd, "Channel already exists.");
+                return 0;
+            }
+            if (me->channel[0] != '\0') {
+                char info[MSG_LEN];
+                snprintf(info, sizeof(info), "%s has quit %s", me->nickname, me->channel);
+                notify_channel(head, me->channel, info, me->fd);
+            }
+            strncpy(me->channel, name, NICK_LEN - 1);
+            me->channel[NICK_LEN - 1] = '\0';
+
             struct message out = {0};
-            char* dest_nickname = msg->infos;
-            if (nickname_exists(head, dest_nickname)){
-                out.type = UNICAST_SEND;
-                out.pld_len = msg->pld_len;
-                strncpy(out.nick_sender, me->nickname, NICK_LEN - 1);
-                struct client_node* dest = find_client_with_name(head, dest_nickname);
-                send_message(dest->fd, &out, payload ? payload : "");
-            } else {
-                char* error_msg = "This nickname doesn't exist.";
-                out.type = ECHO_SEND;
-                out.pld_len = strlen(error_msg) + 1;
-                send_message(me->fd, &out, error_msg);
+            out.type = MULTICAST_CREATE;
+            strncpy(out.nick_sender, "SERVER", NICK_LEN - 1);
+            strncpy(out.infos, name, INFOS_LEN - 1);
+            char text[MSG_LEN];
+            snprintf(text, sizeof(text), "You have created and joined channel %s", name);
+            out.pld_len = (int)strlen(text) + 1;
+            send_message(me->fd, &out, text);
+            return 0;
+        }
+
+        case MULTICAST_LIST: {
+            char buf[MSG_LEN] = {0};
+            size_t off = 0;
+            for (struct client_node *c = head; c; c = c->next) {
+                if (c->channel[0] == '\0'){
+                    continue;
+                }
+                int seen = 0;
+                for (struct client_node *d = head; d != c; d = d->next) {
+                    if (d->channel[0] != '\0' && strcmp(d->channel, c->channel) == 0) {
+                        seen = 1; 
+                        break;
+                    }
+                }
+                if (seen){
+                    continue;
+                }
+                int w = snprintf(buf + off, sizeof(buf) - off, "\t - %s\n", c->channel);
+                if (w < 0 || (size_t)w >= sizeof(buf) - off){
+                    break;
+                }
+                off += (size_t)w;
+            }
+            struct message out = {0};
+            out.type = MULTICAST_LIST;
+            out.pld_len = (int)strlen(buf) + 1;
+            send_message(me->fd, &out, buf);
+            return 0;
+        }
+
+        case MULTICAST_JOIN: {
+            char *name = msg->infos;
+            if (!is_valid_nickname(name)) {
+                send_server_info(me->fd, "Invalid channel name.");
+                return 0;
+            }
+            if (!channel_exists(head, name)) {
+                send_server_info(me->fd, "Channel doesn't exist.");
+                return 0;
+            }
+            if (me->channel[0] != '\0' && strcmp(me->channel, name) == 0) {
+                send_server_info(me->fd, "You are already in this channel.");
+                return 0;
+            }
+            if (me->channel[0] != '\0') {
+                char info[MSG_LEN];
+                snprintf(info, sizeof(info), "%s has quit %s", me->nickname, me->channel);
+                notify_channel(head, me->channel, info, me->fd);
+            }
+            strncpy(me->channel, name, NICK_LEN - 1);
+            me->channel[NICK_LEN - 1] = '\0';
+
+            char info[MSG_LEN];
+            snprintf(info, sizeof(info), "%s has joined %s", me->nickname, name);
+            notify_channel(head, name, info, me->fd);
+
+            struct message out = {0};
+            out.type = MULTICAST_JOIN;
+            strncpy(out.nick_sender, "SERVER", NICK_LEN - 1);
+            strncpy(out.infos, name, INFOS_LEN - 1);
+            char text[MSG_LEN];
+            snprintf(text, sizeof(text), "You have joined %s", name);
+            out.pld_len = (int)strlen(text) + 1;
+            send_message(me->fd, &out, text);
+            return 0;
+        }
+
+        case MULTICAST_SEND: {
+            if (me->channel[0] == '\0' || strcmp(me->channel, msg->infos) != 0) {
+                send_server_info(me->fd, "You are not in this channel.");
+                return 0;
+            }
+            struct message out = {0};
+            out.type = MULTICAST_SEND;
+            out.pld_len = msg->pld_len;
+            strncpy(out.nick_sender, me->nickname, NICK_LEN - 1);
+            strncpy(out.infos, msg->infos, INFOS_LEN - 1);
+            for (struct client_node *c = head; c; c = c->next) {
+                if (c->fd != me->fd && c->channel[0] != '\0'
+                    && strcmp(c->channel, msg->infos) == 0) {
+                    send_message(c->fd, &out, payload);
+                }
             }
             return 0;
         }
 
+        case MULTICAST_QUIT: {
+            char *name = msg->infos;
+            if (me->channel[0] == '\0' || strcmp(me->channel, name) != 0) {
+                send_server_info(me->fd, "You are not in this channel.");
+                return 0;
+            }
+            int count = 0;
+            for (struct client_node *c = head; c; c = c->next) {
+                if (c->channel[0] != '\0' && strcmp(c->channel, name) == 0) count++;
+            }
+            char text[MSG_LEN];
+            if (count <= 1) {
+                snprintf(text, sizeof(text),
+                        "You were the last user in this channel, %s has been destroyed", name);
+            } else {
+                char info[MSG_LEN];
+                snprintf(info, sizeof(info), "%s has quit %s", me->nickname, name);
+                notify_channel(head, name, info, me->fd);
+                snprintf(text, sizeof(text), "You have quit %s", name);
+            }
+            me->channel[0] = '\0';
+
+            struct message out = {0};
+            out.type = MULTICAST_QUIT;
+            strncpy(out.nick_sender, "SERVER", NICK_LEN - 1);
+            strncpy(out.infos, name, INFOS_LEN - 1);
+            out.pld_len = (int)strlen(text) + 1;
+            send_message(me->fd, &out, text);
+            return 0;
+        }
         default:
             fprintf(stderr, "Unhandled message type: %d\n", msg->type);
             send_server_info(me->fd, "Unsupported message type.");
@@ -210,11 +410,12 @@ int handle_bind(char* server_port) {
 		exit(EXIT_FAILURE);
 	}
 	for (rp = result; rp != NULL; rp = rp->ai_next) {
-		sfd = socket(rp->ai_family, rp->ai_socktype,
-		rp->ai_protocol);
+		sfd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
 		if (sfd == -1) {
 			continue;
 		}
+        int yes = 1;
+        setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
 		if (bind(sfd, rp->ai_addr, rp->ai_addrlen) == 0) {
 			break;
 		}
@@ -230,10 +431,10 @@ int handle_bind(char* server_port) {
 
 int recv_full_message(int sockfd, struct message *msg, char **payload_out){
     *payload_out = NULL;
-    if (recv_from_socket(sockfd, msg, sizeof(struct message)) == 0){
+    if (recv_from_socket(sockfd, msg, sizeof(struct message)) != (int)sizeof(struct message)){
         return 1;
     }
-    if (msg->pld_len < 0 || msg->pld_len > MSG_LEN) {
+    if (msg->pld_len < 0 || msg->pld_len > PROTO_MAX_PAYLOAD) {
         return 1;
     } 
     if (msg->pld_len == 0){
@@ -244,13 +445,12 @@ int recv_full_message(int sockfd, struct message *msg, char **payload_out){
     if (*payload_out == NULL){
         return 1;
     }
-
-    if (recv_from_socket(sockfd, *payload_out, msg->pld_len) == 0){
+    if (recv_from_socket(sockfd, *payload_out, msg->pld_len) != msg->pld_len){
         free(*payload_out);
         *payload_out = NULL;
         return 1;
     }
-    (*payload_out)[msg->pld_len - 1] = '\0';
+    //(*payload_out)[msg->pld_len - 1] = '\0';
     return 0;
 }
 
@@ -270,10 +470,14 @@ void server_loop(int sfd){
         fds[i].events = 0;
         fds[i].revents = 0;
     }
-
-	while(1){
+	while(!stop){
         int nb_fds = poll(fds, FD_SIZE_TAB, -1);
-        die(nb_fds, "Poll: ");
+        if (nb_fds < 0) {
+            if (errno == EINTR){
+                continue;
+            }
+            die(nb_fds, "Poll: ");
+        }
 
         for (int i = 0 ; i < FD_SIZE_TAB ; i++){
             if (i == 0 && (fds[0].revents & POLLIN)){ 
@@ -283,23 +487,22 @@ void server_loop(int sfd){
 					perror("accept()\n");
 					exit(EXIT_FAILURE);
 				}
-
 				int fd_number = first_fds_available(fds, FD_SIZE_TAB);
-				fprintf(stdout, "client fds %d\n", fd_number);
                 if (fd_number == -1) {
                     fprintf(stderr, "Too many clients => refusing %d\n", connfd);
                     close(connfd);
                     continue;
                 }
-                add_client(&head, connfd, cli, len);
-               
-
-                fds[fd_number].fd = connfd;
-                fds[fd_number].events = POLLIN;
-                fds[fd_number].revents = 0;
-
+                int ret_value = add_client(&head, connfd, cli, len);
+                if (ret_value == -1){
+                    close(connfd);
+                    continue;
+                } else {
+                    fds[fd_number].fd = connfd;
+                    fds[fd_number].events = POLLIN;
+                    fds[fd_number].revents = 0;
+                }
 			}
-
 			if (i!=0 && (fds[i].revents & POLLIN)){
                 fds[i].revents = 0;
 				struct client_node *me = find_client_with_fd(head, fds[i].fd);
@@ -319,9 +522,23 @@ void server_loop(int sfd){
 					closing_connection(fds, i, &head);
 				}
 			}
+            if (i != 0 && fds[i].fd != -1 && (fds[i].revents & (POLLERR | POLLHUP | POLLNVAL))) {
+                closing_connection(fds, i, &head);
+            }
 		}
 	}
-	free_list(&head);
+    for (int i = 1; i < FD_SIZE_TAB; i++) { // Cannot use closing_connection function. Only close, free (async signal safe)
+        if (fds[i].fd >= 0) {
+            close(fds[i].fd);
+            fds[i].fd = -1;
+        }
+    }
+	struct client_node *current = head; // same for free_list function. We need async signal safe functions only
+    while (current != NULL) {
+        struct client_node *next = current->next;
+        free(current);
+        current = next;
+    }
 }
 
 int main(int argc, char** argv) {
@@ -329,9 +546,10 @@ int main(int argc, char** argv) {
         fprintf(stderr, "Must have only 1 arg, please type: ./server <SERVER_PORT>\n");
         exit(EXIT_FAILURE);
     }
+    signal_stop_server_install();
     char* server_port = argv[1];
 	int sfd;
-	sfd = handle_bind(server_port); // Socket Server
+	sfd = handle_bind(server_port);
 
 	if ((listen(sfd, SOMAXCONN)) != 0) {
 		perror("listen()\n");
@@ -339,6 +557,7 @@ int main(int argc, char** argv) {
 	}
     server_loop(sfd);
 	close(sfd);
+    fprintf(stdout, "\nShutdown signal received. Closing all connections.\n");
 	return EXIT_SUCCESS;
 }
 

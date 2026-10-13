@@ -10,6 +10,7 @@ struct client_node {
     struct sockaddr_storage addr;
     socklen_t addr_len;
     char nickname[NICK_LEN];
+    char channel[NICK_LEN];
     time_t connected_at;
     struct client_node* next;
 };
@@ -21,5 +22,6 @@ struct client_node* find_client_with_name(struct client_node* head, char* nickna
 int nickname_exists(struct client_node* head, char* nickname);
 int* connected_client_fd(struct client_node* head);
 void free_list(struct client_node** head);
+int channel_exists(struct client_node *head, const char *name);
 
 #endif
