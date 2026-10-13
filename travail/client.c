@@ -161,7 +161,7 @@ int listening_socket_peer(int sockfd, struct message *client_msg, char *nickname
 
     struct sockaddr_storage cli;
     int connfd;
-    socklen_t len;
+    socklen_t len = sizeof(cli);
     if ((connfd = accept(sfd, (struct sockaddr*) &cli, &len)) < 0) {
         perror("accept()\n");
         exit(EXIT_FAILURE);
@@ -402,8 +402,6 @@ void stdin_pollin(int sockfd, char* nickname, char* current_channel, struct file
             client_msg.type = NICKNAME_NEW;
             strncpy(client_msg.infos, args, INFOS_LEN - 1);
             client_msg.infos[INFOS_LEN - 1] = '\0';
-            strncpy(nickname, args, NICK_LEN - 1);
-            nickname[NICK_LEN - 1] = '\0';
         } else if (strcmp(cmd, "/who") == 0) {
             client_msg.type = NICKNAME_LIST;
             client_msg.infos[0] = '\0';
@@ -549,6 +547,10 @@ int server_socket_pollin(int sockfd, char *nickname, char *current_channel, stru
             fprintf(stdout, "[Server-%s] : %s\n", msg_type_str[ECHO_SEND], msg ? msg : "");
             break;
         case NICKNAME_NEW:
+            strncpy(nickname, server_msg.infos, NICK_LEN - 1);
+            nickname[NICK_LEN - 1] = '\0';
+            fprintf(stdout, "[Server-%s] : %s\n", msg_type_str[ECHO_SEND], msg ? msg : "");
+            break;
         case UNICAST_SEND:
             fprintf(stdout, "[%s-%s] : %s\n", server_msg.nick_sender, msg_type_str[server_msg.type], msg ? msg : "");
             break;

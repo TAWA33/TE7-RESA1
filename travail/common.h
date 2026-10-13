@@ -11,17 +11,6 @@
 #define FILE_TRANSFERT_ADDR "127.0.0.1"
 #define FILEPATH_LEN 1024
 
-struct header{
-    int size;
-    char username[128];
-    int type;
-};
-
-struct info{
-    short s;
-    long l;
-};
-
 void die(int ret, char* msg);
 int send_on_socket(int socket_fd, void* buf, int size);
 int recv_from_socket(int socket_fd, void* buf, int size);

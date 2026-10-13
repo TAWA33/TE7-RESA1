@@ -40,7 +40,6 @@ int first_fds_available(struct pollfd * fds, int size){
     return -1;
 }
 
-
 int send_message(int sockfd, struct message *msg, char *payload) {
     if (send_on_socket(sockfd, msg, sizeof(struct message)) != (int)sizeof(struct message)){
         return -1;
@@ -53,12 +52,23 @@ int send_message(int sockfd, struct message *msg, char *payload) {
     return 0;
 }
 
+int send_to_fd(int fd, enum msg_type type, char *sender, char *infos, void *payload, int pld_len){
+    struct message out = {0};
+    out.type = type;
+    out.pld_len = pld_len;
+    if (sender) {
+        strncpy(out.nick_sender, sender, NICK_LEN - 1);
+        out.nick_sender[NICK_LEN - 1] = '\0';
+    }
+    if (infos) {
+        strncpy(out.infos, infos, INFOS_LEN - 1);
+        out.infos[INFOS_LEN - 1] = '\0';
+    }
+    return send_message(fd, &out, (char *)payload);
+}
+
 void send_server_info(int sockfd, char *text) {
-    struct message msg = {0};
-    msg.type = ECHO_SEND;
-    msg.nick_sender[0] = '\0';
-    msg.pld_len = (int)strlen(text) + 1;
-    send_message(sockfd, &msg, text);
+    send_to_fd(sockfd, ECHO_SEND, NULL, NULL, text, (int)strlen(text) + 1);
 }
 
 void forward_to_nickname(struct client_node *head, struct client_node *me, enum msg_type type, char *dest_nickname, char *payload, int pld_len){
@@ -74,7 +84,80 @@ void forward_to_nickname(struct client_node *head, struct client_node *me, enum 
     send_message(dest->fd, &out, payload ? payload : "");
 }
 
-int is_valid_nickname(const char* nickname) {
+void broadcast_to_all(struct client_node *head, enum msg_type type, char *sender, void *payload, int pld_len, int exclude_fd){
+    struct message out = {0};
+    out.type = type;
+    out.pld_len = pld_len;
+    if (sender) {
+        strncpy(out.nick_sender, sender, NICK_LEN - 1);
+        out.nick_sender[NICK_LEN - 1] = '\0';
+    }
+    for (struct client_node *c = head; c; c = c->next) {
+        if (c->fd != exclude_fd) {
+            send_message(c->fd, &out, (char *)payload);
+        }
+    }
+}
+
+void send_to_channel(struct client_node *head, char *channel, enum msg_type type, char *sender, void *payload, int pld_len, int exclude_fd){
+    struct message out = {0};
+    out.type = type;
+    out.pld_len = pld_len;
+
+    if (sender){
+        strncpy(out.nick_sender, sender, NICK_LEN - 1);
+    }
+    if (channel){
+        strncpy(out.infos, channel, INFOS_LEN - 1);
+    }
+
+    for (struct client_node *c = head; c; c = c->next) {
+        if (c->fd != exclude_fd && c->channel[0] != '\0' && strcmp(c->channel, channel) == 0) {
+            send_message(c->fd, &out, (char *)payload);
+        }
+    }
+}
+
+void notify_channel(struct client_node *head, char *channel, char *text, int exclude_fd) {
+    send_to_channel(head, channel, MULTICAST_SEND, "SERVER", text, strlen(text) + 1, exclude_fd);
+}
+
+void leave_channel(struct client_node *head, struct client_node *me) {
+    if (me->channel[0] == '\0'){
+        return;
+    }
+    if (me->nickname[0] != '\0') {
+        char info[MSG_LEN];
+        snprintf(info, sizeof(info), "%s has quit %s", me->nickname, me->channel);
+        notify_channel(head, me->channel, info, me->fd);
+    }
+    me->channel[0] = '\0';
+}
+
+void join_channel(struct client_node *head, struct client_node *me, char *name) {
+    leave_channel(head, me);
+
+    strncpy(me->channel, name, NICK_LEN - 1);
+    me->channel[NICK_LEN - 1] = '\0';
+
+    char info[MSG_LEN];
+    snprintf(info, sizeof(info), "%s has joined %s", me->nickname, name);
+    notify_channel(head, name, info, me->fd);
+}
+
+void closing_connection(struct pollfd *fds, int i, struct client_node** head) {
+    struct client_node *me = find_client_with_fd(*head, fds[i].fd);
+    if (me != NULL && me->channel[0] != '\0' && me->nickname[0] != '\0') {
+        leave_channel(*head, me);
+    }
+    remove_client(head, fds[i].fd);
+    close(fds[i].fd);
+    fds[i].fd = -1;
+    fds[i].events = 0;
+    fds[i].revents = 0;
+}
+
+int is_valid_nickname(char* nickname) {
     size_t len = strlen(nickname);
     if (len == 0 || len >= NICK_LEN){
         return 0;
@@ -85,33 +168,6 @@ int is_valid_nickname(const char* nickname) {
         }
     }
     return 1;
-}
-
-void notify_channel(struct client_node *head, char *channel, char *text, int exclude_fd) {
-    struct message out = {0};
-    out.type = MULTICAST_SEND;
-    out.pld_len = (int)strlen(text) + 1;
-    strncpy(out.nick_sender, "SERVER", NICK_LEN - 1);
-    strncpy(out.infos, channel, INFOS_LEN - 1);
-    for (struct client_node *c = head; c; c = c->next) {
-        if (c->fd != exclude_fd && c->channel[0] != '\0' && strcmp(c->channel, channel) == 0) {
-            send_message(c->fd, &out, (char *)text);
-        }
-    }
-}
-
-void closing_connection(struct pollfd *fds, int i, struct client_node** head) {
-    struct client_node *me = find_client_with_fd(*head, fds[i].fd);
-    if (me != NULL && me->channel[0] != '\0' && me->nickname[0] != '\0') {
-        char info[MSG_LEN];
-        snprintf(info, sizeof(info), "%s has quit %s", me->nickname, me->channel);
-        notify_channel(*head, me->channel, info, fds[i].fd);
-    }
-    remove_client(head, fds[i].fd);
-    close(fds[i].fd);
-    fds[i].fd = -1;
-    fds[i].events = 0;
-    fds[i].revents = 0;
 }
 
 int handle_client_message(struct client_node *head, struct client_node *me, struct message *msg, char *payload) {
@@ -127,32 +183,25 @@ int handle_client_message(struct client_node *head, struct client_node *me, stru
                 send_server_info(me->fd, "This nickname is reserved.");
                 return 0;
             }
-
-            int ret_val = is_valid_nickname(new_nick);
-            if (ret_val == 0){
-                fprintf(stderr, "Invalid nickname. Must be between 1 and 127 characters (between 1 and 127 characters).");
+            if (!is_valid_nickname(new_nick)) {
+                send_server_info(me->fd, "Invalid nickname: letters and digits only, max 127.");
+                return 0;
             }
-
             struct client_node *other = find_client_with_name(head, new_nick);
             if (other != NULL && other != me) {
                 send_server_info(me->fd, "Nickname already taken.");
                 return 0;
             }
-
             strncpy(me->nickname, new_nick, NICK_LEN - 1);
             me->nickname[NICK_LEN - 1] = '\0';
 
             char welcome[MSG_LEN];
             snprintf(welcome, sizeof(welcome), "Welcome on the chat %s", me->nickname);
-            send_server_info(me->fd, welcome);
+            send_to_fd(me->fd, NICKNAME_NEW, NULL, me->nickname, welcome, (int)strlen(welcome) + 1);
             return 0;
         }
         case ECHO_SEND: {
-            struct message out = {0};
-            out.type = ECHO_SEND;
-            strncpy(out.nick_sender, me->nickname, NICK_LEN - 1);
-            out.pld_len = msg->pld_len;
-            send_message(me->fd, &out, payload ? payload : "");
+            send_to_fd(me->fd, ECHO_SEND, me->nickname, NULL, payload, msg->pld_len);
             return 0;
         }
         case NICKNAME_LIST: {
@@ -206,27 +255,7 @@ int handle_client_message(struct client_node *head, struct client_node *me, stru
             return 0;
         }
         case BROADCAST_SEND: {
-            struct message out = {0};
-            out.type = BROADCAST_SEND;
-            out.pld_len = msg->pld_len;
-            strncpy(out.nick_sender, me->nickname, NICK_LEN - 1);
-            int* clients_fd = connected_client_fd(head);
-            if (clients_fd == NULL){
-                return 0;
-            }
-            int i = 0;
-            if(clients_fd[i] == -1){
-                printf("No other client");
-                free(clients_fd);
-                return 0;
-            }
-            while(clients_fd[i] != -1){
-                if (clients_fd[i] != me->fd){
-                    send_message(clients_fd[i], &out, payload);
-                }
-                i++;
-            }
-            free(clients_fd);
+            broadcast_to_all(head, BROADCAST_SEND, me->nickname, payload, msg->pld_len, me->fd);
             return 0;
         }
         case UNICAST_SEND: {
@@ -257,21 +286,14 @@ int handle_client_message(struct client_node *head, struct client_node *me, stru
                 return 0;
             }
             if (me->channel[0] != '\0') {
-                char info[MSG_LEN];
-                snprintf(info, sizeof(info), "%s has quit %s", me->nickname, me->channel);
-                notify_channel(head, me->channel, info, me->fd);
+                leave_channel(head, me);
             }
             strncpy(me->channel, name, NICK_LEN - 1);
             me->channel[NICK_LEN - 1] = '\0';
 
-            struct message out = {0};
-            out.type = MULTICAST_CREATE;
-            strncpy(out.nick_sender, "SERVER", NICK_LEN - 1);
-            strncpy(out.infos, name, INFOS_LEN - 1);
             char text[MSG_LEN];
             snprintf(text, sizeof(text), "You have created and joined channel %s", name);
-            out.pld_len = (int)strlen(text) + 1;
-            send_message(me->fd, &out, text);
+            send_to_fd(me->fd, MULTICAST_CREATE, "SERVER", name, text, (int)strlen(text) + 1);
             return 0;
         }
 
@@ -319,26 +341,12 @@ int handle_client_message(struct client_node *head, struct client_node *me, stru
                 send_server_info(me->fd, "You are already in this channel.");
                 return 0;
             }
-            if (me->channel[0] != '\0') {
-                char info[MSG_LEN];
-                snprintf(info, sizeof(info), "%s has quit %s", me->nickname, me->channel);
-                notify_channel(head, me->channel, info, me->fd);
-            }
-            strncpy(me->channel, name, NICK_LEN - 1);
-            me->channel[NICK_LEN - 1] = '\0';
 
-            char info[MSG_LEN];
-            snprintf(info, sizeof(info), "%s has joined %s", me->nickname, name);
-            notify_channel(head, name, info, me->fd);
+            join_channel(head, me, name);
 
-            struct message out = {0};
-            out.type = MULTICAST_JOIN;
-            strncpy(out.nick_sender, "SERVER", NICK_LEN - 1);
-            strncpy(out.infos, name, INFOS_LEN - 1);
             char text[MSG_LEN];
             snprintf(text, sizeof(text), "You have joined %s", name);
-            out.pld_len = (int)strlen(text) + 1;
-            send_message(me->fd, &out, text);
+            send_to_fd(me->fd, MULTICAST_JOIN, "SERVER", name, text, (int)strlen(text) + 1);
             return 0;
         }
 
@@ -347,17 +355,7 @@ int handle_client_message(struct client_node *head, struct client_node *me, stru
                 send_server_info(me->fd, "You are not in this channel.");
                 return 0;
             }
-            struct message out = {0};
-            out.type = MULTICAST_SEND;
-            out.pld_len = msg->pld_len;
-            strncpy(out.nick_sender, me->nickname, NICK_LEN - 1);
-            strncpy(out.infos, msg->infos, INFOS_LEN - 1);
-            for (struct client_node *c = head; c; c = c->next) {
-                if (c->fd != me->fd && c->channel[0] != '\0'
-                    && strcmp(c->channel, msg->infos) == 0) {
-                    send_message(c->fd, &out, payload);
-                }
-            }
+            send_to_channel(head, me->channel, MULTICAST_SEND, me->nickname, payload, msg->pld_len, me->fd);
             return 0;
         }
 
@@ -373,8 +371,7 @@ int handle_client_message(struct client_node *head, struct client_node *me, stru
             }
             char text[MSG_LEN];
             if (count <= 1) {
-                snprintf(text, sizeof(text),
-                        "You were the last user in this channel, %s has been destroyed", name);
+                snprintf(text, sizeof(text), "You were the last user in this channel, %s has been destroyed", name);
             } else {
                 char info[MSG_LEN];
                 snprintf(info, sizeof(info), "%s has quit %s", me->nickname, name);
@@ -383,12 +380,7 @@ int handle_client_message(struct client_node *head, struct client_node *me, stru
             }
             me->channel[0] = '\0';
 
-            struct message out = {0};
-            out.type = MULTICAST_QUIT;
-            strncpy(out.nick_sender, "SERVER", NICK_LEN - 1);
-            strncpy(out.infos, name, INFOS_LEN - 1);
-            out.pld_len = (int)strlen(text) + 1;
-            send_message(me->fd, &out, text);
+            send_to_fd(me->fd, MULTICAST_QUIT, "SERVER", name, text, (int)strlen(text) + 1);
             return 0;
         }
         default:
